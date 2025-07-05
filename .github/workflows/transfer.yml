@@ -1,0 +1,136 @@
+name: PikPak-Rclone Transfer Worker
+
+# 触发器：只接受来自 API 的调用
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'The ID of the task from the orchestrator'
+        required: true
+      files_json:
+        description: 'A JSON string of files to transfer. e.g., [{"url": "...", "dest": "..."}]'
+        required: true
+
+env:
+  # 这些 secrets 需要在你的 GitHub 仓库中设置
+  # Settings -> Secrets and variables -> Actions -> New repository secret
+  RCLONE_CONF_BASE64: ${{ secrets.RCLONE_CONF_BASE64 }}
+  CALLBACK_URL_BASE: ${{ secrets.CALLBACK_URL_BASE }}
+  RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+
+jobs:
+  transfer:
+    # 使用成本更低、速度更快的 Ubuntu 运行器
+    runs-on: ubuntu-latest
+    # 设置一个超时时间，防止工作流卡死
+    timeout-minutes: 120 # 2小时超时
+    steps:
+      - name: Install dependencies (jq, curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Setup Rclone
+        run: |
+          echo "Setting up Rclone configuration..."
+          # 确保 rclone 配置目录存在
+          mkdir -p ~/.config/rclone
+          # 检查 secret 是否已设置
+          if [ -z "${{ env.RCLONE_CONF_BASE64 }}" ]; then
+            echo "::error::RCLONE_CONF_BASE64 secret is not set."
+            exit 1
+          fi
+          # 从 secrets 解码并写入 rclone 配置文件
+          echo "${{ env.RCLONE_CONF_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          
+          echo "Installing Rclone..."
+          curl https://rclone.org/install.sh | sudo bash
+          echo "Rclone setup complete."
+          rclone version
+
+      - name: Transfer Files
+        id: transfer_step
+        run: |
+          # set -e: 任何命令失败立即退出
+          # set -o pipefail: 管道中的任何命令失败，整个管道都算失败
+          set -eo pipefail
+
+          echo "Starting file transfer for Task ID: ${{ github.event.inputs.task_id }}"
+          
+          # 解析从后端传入的 JSON 字符串
+          # 使用 jq -c '.[]' 将 JSON 数组的每个对象输出为一行，便于 shell 循环处理
+          files_to_process=$(echo '${{ github.event.inputs.files_json }}' | jq -c '.[]')
+          
+          if [ -z "$files_to_process" ]; then
+            echo "::error::No files found in the input JSON. Aborting."
+            echo "transfer_status=failed" >> $GITHUB_OUTPUT
+            echo "error_message=Input files_json was empty or invalid." >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # 循环处理每个文件
+          echo "$files_to_process" | while IFS= read -r item; do
+            source_url=$(echo "$item" | jq -r '.url')
+            destination_path=$(echo "$item" | jq -r '.dest')
+            
+            echo "--------------------------------------------------"
+            echo "Transferring:"
+            echo "  Source URL: (URL is hidden for security)"
+            echo "  Destination: ${{ env.RCLONE_REMOTE_NAME }}:${destination_path}"
+            echo "--------------------------------------------------"
+            
+            # 使用 rclone copyurl 进行流式传输，并增加健壮性参数
+            # --progress: 显示进度
+            # --retries 3: 失败时重试3次
+            # --contimeout 60s: 连接超时设为60秒
+            # --timeout 2h: 整个传输超时设为2小时
+            # --no-check-certificate: 忽略 SSL 证书问题，增加对自签名证书等的兼容性
+            rclone copyurl "${source_url}" "${{ env.RCLONE_REMOTE_NAME }}:${destination_path}" \
+              --progress \
+              --retries 3 \
+              --contimeout 60s \
+              --timeout 2h \
+              --no-check-certificate
+            
+            # 检查 rclone 命令的退出码
+            if [ $? -ne 0 ]; then
+              echo "::error::Rclone transfer failed for ${destination_path}"
+              # 设置输出变量，以便回调步骤可以获取错误信息
+              echo "transfer_status=failed" >> $GITHUB_OUTPUT
+              echo "error_message=Rclone transfer failed for file: ${destination_path}" >> $GITHUB_OUTPUT
+              exit 1 # 立即中止整个脚本
+            fi
+          done
+
+          # 如果循环成功完成，设置成功状态
+          echo "All files transferred successfully."
+          echo "transfer_status=success" >> $GITHUB_OUTPUT
+
+      - name: Send Callback to Orchestrator
+        # 无论上一步成功或失败都执行此步骤
+        if: always()
+        run: |
+          TASK_ID="${{ github.event.inputs.task_id }}"
+          # 如果 transfer_step 成功，其 outputs.transfer_status 会是 'success'
+          # 如果失败，它会被设置为 'failed'
+          # 如果 transfer_step 因为其他原因被跳过或取消，默认为 'failed'
+          STATUS="${{ steps.transfer_step.outputs.transfer_status || 'failed' }}"
+          ERROR_MSG="${{ steps.transfer_step.outputs.error_message || 'Workflow failed at an unexpected step or was cancelled.' }}"
+          
+          CALLBACK_URL="${{ env.CALLBACK_URL_BASE }}/${TASK_ID}"
+          
+          echo "Sending callback to: ${CALLBACK_URL}"
+          echo "Status: ${STATUS}"
+          
+          if [ "${STATUS}" = "success" ]; then
+            JSON_PAYLOAD='{"status": "success"}'
+          else
+            # 对错误消息进行JSON转义，以防止它破坏JSON结构
+            ESCAPED_ERROR_MSG=$(echo "${ERROR_MSG}" | jq -R -s '.')
+            JSON_PAYLOAD="{\"status\": \"failed\", \"error_message\": ${ESCAPED_ERROR_MSG}}"
+          fi
+          
+          echo "Payload: ${JSON_PAYLOAD}"
+          
+          # 使用 curl 发送回调，增加重试和超时
+          curl --retry 3 --retry-delay 5 -X POST -H "Content-Type: application/json" -d "${JSON_PAYLOAD}" "${CALLBACK_URL}"
