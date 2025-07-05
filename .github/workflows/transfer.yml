@@ -1,6 +1,6 @@
 name: PikPak-Rclone Transfer Worker
 
-# 触发器：只接受来自 API 的调用
+# 触发器：只接受来自 API 的调用 (workflow_dispatch)
 on:
   workflow_dispatch:
     inputs:
@@ -11,19 +11,24 @@ on:
         description: 'A JSON string of files to transfer. e.g., [{"url": "...", "dest": "..."}]'
         required: true
 
+# 环境变量，从 GitHub Secrets 中读取
 env:
-  # 这些 secrets 需要在你的 GitHub 仓库中设置
-  # Settings -> Secrets and variables -> Actions -> New repository secret
+  # Rclone 配置文件，经过 Base64 编码
   RCLONE_CONF_BASE64: ${{ secrets.RCLONE_CONF_BASE64 }}
+  # 后端回调 URL 的基础部分, e.g., "https://your-app.com/api/v1/callbacks/github"
   CALLBACK_URL_BASE: ${{ secrets.CALLBACK_URL_BASE }}
+  # Rclone 配置文件中的远端名称, e.g., "rclonegithub"
   RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+  # 要上传到 OneDrive 的目标文件夹路径, e.g., "My Videos/FromPikPak"
+  RCLONE_TARGET_DIR: ${{ secrets.RCLONE_TARGET_DIRECTORY }}
 
 jobs:
   transfer:
     # 使用成本更低、速度更快的 Ubuntu 运行器
     runs-on: ubuntu-latest
-    # 设置一个超时时间，防止工作流卡死
+    # 设置一个超时时间，防止工作流因网络问题卡死
     timeout-minutes: 120 # 2小时超时
+    
     steps:
       - name: Install dependencies (jq, curl)
         run: |
@@ -35,7 +40,7 @@ jobs:
           echo "Setting up Rclone configuration..."
           # 确保 rclone 配置目录存在
           mkdir -p ~/.config/rclone
-          # 检查 secret 是否已设置
+          # 检查 secret 是否已设置，如果未设置则报错退出
           if [ -z "${{ env.RCLONE_CONF_BASE64 }}" ]; then
             echo "::error::RCLONE_CONF_BASE64 secret is not set."
             exit 1
@@ -71,21 +76,20 @@ jobs:
           # 循环处理每个文件
           echo "$files_to_process" | while IFS= read -r item; do
             source_url=$(echo "$item" | jq -r '.url')
+            # destination_path 是重命名后的文件名，例如 "1844.MP4"
             destination_path=$(echo "$item" | jq -r '.dest')
+            
+            # 构造完整的最终路径，拼接目标文件夹和文件名
+            full_destination_path="${{ env.RCLONE_TARGET_DIR }}/${destination_path}"
             
             echo "--------------------------------------------------"
             echo "Transferring:"
             echo "  Source URL: (URL is hidden for security)"
-            echo "  Destination: ${{ env.RCLONE_REMOTE_NAME }}:${destination_path}"
+            echo "  Destination: ${{ env.RCLONE_REMOTE_NAME }}:${full_destination_path}"
             echo "--------------------------------------------------"
             
             # 使用 rclone copyurl 进行流式传输，并增加健壮性参数
-            # --progress: 显示进度
-            # --retries 3: 失败时重试3次
-            # --contimeout 60s: 连接超时设为60秒
-            # --timeout 2h: 整个传输超时设为2小时
-            # --no-check-certificate: 忽略 SSL 证书问题，增加对自签名证书等的兼容性
-            rclone copyurl "${source_url}" "${{ env.RCLONE_REMOTE_NAME }}:${destination_path}" \
+            rclone copyurl "${source_url}" "${{ env.RCLONE_REMOTE_NAME }}:${full_destination_path}" \
               --progress \
               --retries 3 \
               --contimeout 60s \
